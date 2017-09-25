@@ -605,7 +605,7 @@ class DirSharedItemsEndpoint(APIView):
                 ExtraGroupsSharePermission.objects.delete_share_permission(repo_id, 
                                                                           group_id)
             send_perm_audit_msg('delete-repo-perm', username, group_id,
-                                repo_id, path, permission)
+                                repo_id, path, 'admin')
 
         return HttpResponse(json.dumps({'success': True}), status=200,
                             content_type=json_content_type)
