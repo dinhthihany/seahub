@@ -18,6 +18,11 @@ import mimetypes
 import urlparse
 import datetime
 import hashlib
+from StringIO import StringIO
+from PIL import Image
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from PyPDF2 import PdfFileWriter, PdfFileReader
 
 from django.core import signing
 from django.core.cache import cache
@@ -67,6 +72,8 @@ from seahub.utils import HAS_OFFICE_CONVERTER, FILEEXT_TYPE_MAP
 from seahub.utils.http import json_response, int_param, BadRequestException, RequestForbbiddenException
 from seahub.views import check_folder_permission, check_file_lock, \
     get_unencry_rw_repos_by_user
+from seahub.thumbnail.utils import add_text_to_image
+from seahub.base.templatetags.seahub_tags import email2nickname
 
 if HAS_OFFICE_CONVERTER:
     from seahub.utils import (
@@ -76,7 +83,8 @@ if HAS_OFFICE_CONVERTER:
 
 import seahub.settings as settings
 from seahub.settings import FILE_ENCODING_LIST, FILE_PREVIEW_MAX_SIZE, \
-    FILE_ENCODING_TRY_LIST, USE_PDFJS, MEDIA_URL
+    FILE_ENCODING_TRY_LIST, USE_PDFJS, MEDIA_URL, ENABLE_SHARE_LINK_WATERMARK, \
+    WATERMARK_PATH
 
 try:
     from seahub.settings import ENABLE_OFFICE_WEB_APP
@@ -853,20 +861,85 @@ def view_shared_file(request, fileshare):
     fileshare.view_cnt = F('view_cnt') + 1
     fileshare.save()
 
+    access_token = seafile_api.get_fileserver_access_token(repo.id,
+            obj_id, 'view', '', use_onetime=False)
+
+    if not access_token:
+        return render_error(request, _(u'Unable to view file'))
+
     # send statistic messages
     file_size = seafile_api.get_file_size(repo.store_id, repo.version, obj_id)
     if request.GET.get('dl', '') == '1':
         if fileshare.get_permissions()['can_download'] is False:
             raise Http404
 
+        if ENABLE_SHARE_LINK_WATERMARK:
+            filetype, fileext = get_file_type_and_ext(filename)
+            watermark_parent_path = os.path.join(WATERMARK_PATH, filetype)
+            if not os.path.exists(watermark_parent_path):
+                os.makedirs(watermark_parent_path)
+
+            watermark_source_path = os.path.join(watermark_parent_path, obj_id)
+
+            if filetype == 'IMAGE':
+                if os.path.exists(watermark_source_path):
+                    image = Image.open(watermark_source_path)
+                else:
+                    image_content = urllib2.urlopen(gen_file_get_url(access_token, filename)).read()
+                    image = Image.open(StringIO(image_content))
+                    image = add_text_to_image(image, shared_by, email2nickname(shared_by))
+                    image.save(watermark_source_path, 'PNG')
+
+                response = HttpResponse(content_type='image/png')
+                response['Content-Disposition'] = 'attachment; filename=%s' % filename
+                image.save(response, 'PNG')
+                return response
+
+            if filetype == 'PDF':
+                pdfWrite =  PdfFileWriter()
+                if os.path.exists(watermark_source_path):
+                    with open(watermark_source_path, 'rb') as f:
+                        pdfReader = PdfFileReader(f)
+                        for i in xrange(pdfReader.getNumPages()):
+                            pdfWrite.addPage(pdfReader.getPage(i))
+                else:
+                    pdf_content = urllib2.urlopen(gen_file_get_url(access_token, filename)).read()
+                    pdfReader = PdfFileReader(StringIO(pdf_content))
+                    watermark_stringIO = StringIO()
+                    c = canvas.Canvas(watermark_stringIO, pagesize=letter)
+                    c.drawString(50, 30, email2nickname(shared_by))
+                    c.drawString(20, 60, shared_by)
+                    c.save()
+                    watermark_stringIO.seek(0)
+                    watermark_pdf = PdfFileReader(watermark_stringIO)
+                    watermark_pdf = watermark_pdf.getPage(0)
+
+                    print '-----' * 10
+                    print pdfReader.getNumPages()
+                    print '-----' * 10
+                    for i in xrange(pdfReader.getNumPages()):
+                        print '-' * 50
+                        print i
+                        temp_pdf = pdfReader.getPage(i)
+                        #Rectangle = temp_pdf.mediaBox
+                        #print Rectangle
+                        #c = canvas.Canvas(watermark_stringIO, pagesize=letter)
+                        #c.drawString(Rectangle.getWidth() - 40, Rectangle.getHeight() - 70, email2nickname(shared_by))
+                        #c.drawString(Rectangle.getWidth() - 110, Rectangle.getHeight() - 100, shared_by)
+                        #c.save()
+                        #watermark_stringIO.seek(0)
+                        #watermark_pdf = PdfFileReader(watermark_stringIO)
+                        #watermark_pdf = watermark_pdf.getPage(0)
+                        temp_pdf.mergePage(watermark_pdf)
+                        pdfWrite.addPage(temp_pdf)
+
+                response = HttpResponse(content_type='application/pdf')
+                response['Content-Disposition'] = 'attachment; filename=%s' % filename
+                pdfWrite.write(response)
+                return response
+
         # download shared file
         return _download_file_from_share_link(request, fileshare)
-
-    access_token = seafile_api.get_fileserver_access_token(repo.id,
-            obj_id, 'view', '', use_onetime=False)
-
-    if not access_token:
-        return render_error(request, _(u'Unable to view file'))
 
 
     raw_path = gen_file_get_url(access_token, filename)
